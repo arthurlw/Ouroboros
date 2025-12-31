@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"ouroboros/internal/sandbox"
 	"ouroboros/internal/skills"
+	"path/filepath"
 	"strings"
 )
 
@@ -52,9 +54,25 @@ func (a *Agent) EvolutionLoop(ctx context.Context, goal string) error {
 }
 
 func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBudget) error {
-	code, test, err := a.Generator.GenerateCodeAndTest(ctx, step.Prompt)
+	// 1. CHECK FOR EXISTING CODE (The "In-Place" Fix)
+	var oldCode, oldTest string
+
+	// We look in the verified library path for this tool name
+	toolPath := filepath.Join(a.Registry.LibraryPath, step.ToolName)
+	if _, err := os.Stat(toolPath); err == nil {
+		slog.Info("📂 FOUND EXISTING TOOL VERSION. LOADING...", "tool", step.ToolName)
+		// Best effort load
+		c, _ := os.ReadFile(filepath.Join(toolPath, "main.go"))
+		t, _ := os.ReadFile(filepath.Join(toolPath, "main_test.go"))
+		oldCode = string(c)
+		oldTest = string(t)
+	}
+
+	// 2. GENERATE (Passing old code if it exists)
+	code, test, err := a.Generator.GenerateCodeAndTest(ctx, step.Prompt, oldCode, oldTest)
 	if err != nil { return err }
 
+	// 3. CONVERGENCE LOOP
 	for i := 0; i < budget.MaxRetries; i++ {
 		slog.Info("🔄 ITERATION", "current", i+1, "max", budget.MaxRetries)
 
@@ -73,7 +91,7 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 		}
 
 		slog.Warn("🔴 TEST FAILED", "reason", feedback)
-		
+
 		if strings.Contains(feedback, "[build failed]") {
 			if strings.Contains(feedback, "main.go") {
 				code, err = a.refineCode(code, test, feedback, "main")
@@ -102,19 +120,15 @@ func (a *Agent) refineCode(code string, test string, feedback string, target str
 	if target == "main" {
 		instructions = `
 1. ANALYZE the test failure.
-2. Check if the definitions of "Special Characters" match between the Generator and the Validator.
-   - Example: Does the Validator include symbols like '@' or '_' that the test uses?
-3. Fix the logic in main.go.
+2. Fix the logic in main.go.
+3. Ensure 'package main'.
 4. DO NOT include test functions.`
 	} else {
-		// NEUTRAL PROMPT: No biased examples
 		instructions = `
 1. ANALYZE the test data vs requirements.
-2. Count the characters in the test input manually. 
-   - Does "P@ssw0rd1234!" actually meet the requirements (Length, Special Chars, etc)?
-   - If it DOES meet requirements, but the test expects failure, FIX the test expectation.
-   - If it DOES NOT meet requirements, but the test expects success, FIX the test input string.
-3. DO NOT redeclare structs defined in main.go.`
+2. Fix the assertions in main_test.go.
+3. Ensure 'package main'.
+4. DO NOT redeclare structs defined in main.go.`
 	}
 
 	prompt := fmt.Sprintf(`
@@ -136,13 +150,13 @@ INSTRUCTIONS:
 
 	newCode, err := a.LLM.Generate(a.Context, prompt)
 	if err != nil { return "", err }
-	
+
 	extracted := extractBlock(newCode, "go")
 	if extracted == "" {
 		if strings.Contains(newCode, "package main") {
 			return newCode, nil
 		}
-		return newCode, nil 
+		return newCode, nil
 	}
 	return extracted, nil
 }

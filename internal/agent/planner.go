@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// Plan represents the roadmap the agent generates.
 type Plan struct {
 	Goal  string `json:"goal"`
 	Steps []Step `json:"steps"`
@@ -37,13 +36,12 @@ func (p *StandardPlanner) Plan(ctx context.Context, goal string, tools []skills.
 	logger := slog.With("component", "planner", "goal", goal)
 	logger.Info("🔵 STARTING PLANNING PHASE (Waiting for AI...)")
 
-	// 1. Construct Context
 	var toolList []string
 	for _, t := range tools {
 		toolList = append(toolList, fmt.Sprintf("- %s: %s", t.Name, t.Description))
 	}
 
-	// 2. Strict Prompt
+	// NEW: Explicit instruction to reuse tool_name for multi-step evolution
 	systemPrompt := fmt.Sprintf(`
 You are Ouroboros, a recursive self-improving system.
 Your goal: "%s"
@@ -52,19 +50,30 @@ Available Tools:
 %s
 
 INSTRUCTIONS:
-1. Break the goal into atomic steps.
-2. Return a JSON object strictly following this schema:
+1. Break the goal into atomic steps (e.g. 1. Build Core, 2. Add Optimization, 3. Add Tests).
+2. CRITICAL: If Step 2 modifies Step 1, USE THE EXACT SAME 'tool_name'.
+   - Bad: Step 1 'fib_calc', Step 2 'memoizer' (Creates 2 folders)
+   - Good: Step 1 'fib_calc', Step 2 'fib_calc' (Refactors the same tool)
+3. Return a JSON object strictly following this schema:
 
 {
-  "goal": "The user's goal",
+  "goal": "...",
   "steps": [
     {
       "id": 1,
-      "description": "Generate the code",
-      "tool_name": "password_generator",
+      "description": "Build the basic logic",
+      "tool_name": "my_tool",
       "uses_existing_tool": false,
       "is_self_improvement": false,
-      "prompt": "Write a Go program that generates a random secure password..."
+      "prompt": "Write a Go program that..."
+    },
+    {
+      "id": 2,
+      "description": "Add optimization",
+      "tool_name": "my_tool",
+      "uses_existing_tool": false,
+      "is_self_improvement": false,
+      "prompt": "Update the existing code to include..."
     }
   ]
 }
@@ -72,19 +81,12 @@ INSTRUCTIONS:
 CONSTRAINT: Return ONLY raw JSON. No markdown.
 `, goal, strings.Join(toolList, "\n"))
 
-	// 3. Call LLM
 	rawResponse, err := p.LLM.Generate(ctx, systemPrompt)
-	if err != nil {
-		return Plan{}, err
-	}
+	if err != nil { return Plan{}, err }
 
-	// SLOW DOWN: Artificial delay so you can see the logs in terminal
 	time.Sleep(500 * time.Millisecond)
-
-	// 4. Debug Logging (CRITICAL: This tells us what the AI actually said)
 	logger.Info("🗣️ RAW LLM RESPONSE", "content", rawResponse)
 
-	// 5. Clean & Parse
 	rawResponse = cleanJSON(rawResponse)
 	var plan Plan
 	if err := json.Unmarshal([]byte(rawResponse), &plan); err != nil {
@@ -92,9 +94,7 @@ CONSTRAINT: Return ONLY raw JSON. No markdown.
 		return Plan{}, fmt.Errorf("malformed plan: %w", err)
 	}
 
-	// 6. Verification
 	if len(plan.Steps) == 0 {
-		logger.Error("⚠️  PLAN WAS EMPTY! The AI returned valid JSON but 0 steps.")
 		return Plan{}, fmt.Errorf("AI returned empty plan")
 	}
 
@@ -104,7 +104,6 @@ CONSTRAINT: Return ONLY raw JSON. No markdown.
 
 func cleanJSON(s string) string {
 	s = strings.TrimSpace(s)
-	// Remove markdown code fences if present
 	if strings.HasPrefix(s, "```") {
 		lines := strings.Split(s, "\n")
 		if len(lines) >= 2 {
