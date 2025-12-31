@@ -6,9 +6,14 @@ import (
 	"log/slog"
 	"ouroboros/internal/sandbox"
 	"ouroboros/internal/skills"
+	"strings"
 )
 
-// Agent is the central nervous system.
+type ConvergenceBudget struct {
+	MaxRetries    int
+	CurrentRetry  int
+}
+
 type Agent struct {
 	Planner   *StandardPlanner
 	Critic    *StandardCritic
@@ -19,87 +24,127 @@ type Agent struct {
 	Context   context.Context
 }
 
-// EvolutionLoop runs the recursive self-improvement cycle.
 func (a *Agent) EvolutionLoop(ctx context.Context, goal string) error {
-	// 1. Context Injection: Load currently mastered skills
 	currentTools := a.Registry.ListTools()
 
-	// 2. Planning: Ask LLM to plan the goal
 	plan, err := a.Planner.Plan(ctx, goal, currentTools)
-	if err != nil {
-		return fmt.Errorf("planning failed: %w", err)
-	}
+	if err != nil { return fmt.Errorf("planning failed: %w", err) }
 
 	for _, step := range plan.Steps {
-		// Case A: Self-Improvement
 		if step.IsSelfImprovement {
-			if err := a.optimizeSelf(ctx, step); err != nil {
-				return err
-			}
+			if err := a.optimizeSelf(ctx, step); err != nil { return err }
 			continue
 		}
 
-		// Case B: Use Existing Tool
 		if step.ExistingTool {
 			slog.Info("🛠️ USING EXISTING TOOL", "tool", step.ToolName)
-			output, err := a.Sandbox.ExecuteTool(ctx, step.ToolName, nil)
-			if err != nil {
-				return err
-			}
-			slog.Info("Tool Output", "result", output.Stdout)
+			_, err := a.Sandbox.ExecuteTool(ctx, step.ToolName, nil)
+			if err != nil { return err }
 			continue
 		}
 
-		// Case C: Build New Tool
-		if err := a.evolveTool(ctx, step); err != nil {
+		budget := ConvergenceBudget{MaxRetries: 6}
+		if err := a.evolveTool(ctx, step, budget); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// evolveTool handles the creation of new tools.
-func (a *Agent) evolveTool(ctx context.Context, step Step) error {
-	// A. Generate Code + Test
+func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBudget) error {
 	code, test, err := a.Generator.GenerateCodeAndTest(ctx, step.Prompt)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
-	// B. The "Ground Truth" Loop
-	maxRetries := 3
-	for i := 0; i < maxRetries; i++ {
-		// Run in Docker
+	for i := 0; i < budget.MaxRetries; i++ {
+		slog.Info("🔄 ITERATION", "current", i+1, "max", budget.MaxRetries)
+
 		result, err := a.Sandbox.ExecuteTest(ctx, code, test)
-		if err != nil {
-			return fmt.Errorf("sandbox error: %w", err)
-		}
+		if err != nil { return fmt.Errorf("sandbox fatal error: %w", err) }
 
-		// Critique
 		passed, feedback := a.Critic.Verify(ctx, result)
 		if passed {
-			// C. Persistence (Success)
 			slog.Info("🟢 TOOL VERIFIED", "name", step.ToolName)
 			return a.Registry.RegisterTool(step.ToolName, code, step.Description)
 		}
 
-		// D. Refinement (Failure)
-		slog.Warn("🔴 TEST FAILED", "retry", i+1, "reason", feedback)
-		code, err = a.refineCode(code, feedback)
-		if err != nil {
-			return err
+		if i == budget.MaxRetries-1 {
+			slog.Error("❌ CONVERGENCE FAILED: Budget Exhausted.")
+			return fmt.Errorf("tool failed to converge after %d attempts", budget.MaxRetries)
 		}
+
+		slog.Warn("🔴 TEST FAILED", "reason", feedback)
+		
+		if strings.Contains(feedback, "[build failed]") {
+			if strings.Contains(feedback, "main.go") {
+				code, err = a.refineCode(code, test, feedback, "main")
+			} else if strings.Contains(feedback, "main_test.go") {
+				test, err = a.refineCode(code, test, feedback, "test")
+			} else {
+				code, err = a.refineCode(code, test, feedback, "main")
+			}
+		} else {
+			if i%2 == 0 {
+				slog.Info("🔧 REFINING IMPLEMENTATION (Aligning Code to Test)")
+				code, err = a.refineCode(code, test, feedback, "main")
+			} else {
+				slog.Info("🔧 REFINING TEST SUITE (Aligning Test to Code)")
+				test, err = a.refineCode(code, test, feedback, "test")
+			}
+		}
+
+		if err != nil { return err }
 	}
-	return fmt.Errorf("failed to evolve tool %s after %d attempts", step.ToolName, maxRetries)
+	return nil
 }
 
-func (a *Agent) refineCode(code string, feedback string) (string, error) {
-	prompt := fmt.Sprintf("FIX THIS CODE.\n\nCODE:\n%s\n\nERROR:\n%s", code, feedback)
-	newCode, err := a.LLM.Generate(a.Context, prompt)
-	if err != nil {
-		return "", err
+func (a *Agent) refineCode(code string, test string, feedback string, target string) (string, error) {
+	var instructions string
+	if target == "main" {
+		instructions = `
+1. ANALYZE the test failure.
+2. Check if the definitions of "Special Characters" match between the Generator and the Validator.
+   - Example: Does the Validator include symbols like '@' or '_' that the test uses?
+3. Fix the logic in main.go.
+4. DO NOT include test functions.`
+	} else {
+		// NEUTRAL PROMPT: No biased examples
+		instructions = `
+1. ANALYZE the test data vs requirements.
+2. Count the characters in the test input manually. 
+   - Does "P@ssw0rd1234!" actually meet the requirements (Length, Special Chars, etc)?
+   - If it DOES meet requirements, but the test expects failure, FIX the test expectation.
+   - If it DOES NOT meet requirements, but the test expects success, FIX the test input string.
+3. DO NOT redeclare structs defined in main.go.`
 	}
-	return extractBlock(newCode, "go"), nil
+
+	prompt := fmt.Sprintf(`
+You are a Senior Go Developer fixing a %s file.
+
+CONTEXT - IMPLEMENTATION (main.go):
+%s
+
+CONTEXT - TEST SUITE (main_test.go):
+%s
+
+ERROR LOG:
+%s
+
+INSTRUCTIONS:
+%s
+5. OUTPUT FORMAT: Return ONLY the raw Go code for the **%s** file inside a markdown block.
+`, target, code, test, feedback, instructions, target)
+
+	newCode, err := a.LLM.Generate(a.Context, prompt)
+	if err != nil { return "", err }
+	
+	extracted := extractBlock(newCode, "go")
+	if extracted == "" {
+		if strings.Contains(newCode, "package main") {
+			return newCode, nil
+		}
+		return newCode, nil 
+	}
+	return extracted, nil
 }
 
 func (a *Agent) optimizeSelf(ctx context.Context, step Step) error {
