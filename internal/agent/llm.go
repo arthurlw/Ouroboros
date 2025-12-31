@@ -28,8 +28,8 @@ func NewClient() *Client {
 		slog.Info("🧠 Using Provider: GROQ")
 		return &Client{
 			APIKey:  key,
-			Model:   "llama3-70b-8192",
-			BaseURL: "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+			Model:   "llama-3.3-70b-versatile",
+			BaseURL: "https://api.groq.com/openai/v1/chat/completions",
 		}
 	}
 

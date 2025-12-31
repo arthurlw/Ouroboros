@@ -23,14 +23,16 @@ func (g *Generator) GenerateCodeAndTest(ctx context.Context, requirement string)
 TASK: Write a GO program and a corresponding TEST SUITE.
 REQUIREMENT: %s
 
-OUTPUT FORMAT:
-You must provide two distinct blocks of code wrapped in markdown.
-Block 1: The implementation (package main)
-Block 2: The test (package main_test)
+CRITICAL INSTRUCTIONS:
+1. Both the implementation and the test MUST belong to 'package main'.
+2. Do NOT use 'package main_test'.
+3. Do NOT try to import the code as a module.
+4. The code must be self-contained.
 
-CONSTRAINT:
-- Use standard library only where possible.
-- The code must be self-contained in one file logic.
+OUTPUT FORMAT:
+Provide two blocks wrapped in markdown.
+Block 1: implementation.go (package main)
+Block 2: implementation_test.go (package main)
 `, requirement)
 
 	raw, err := g.LLM.Generate(ctx, prompt)
@@ -61,15 +63,20 @@ func extractBlock(content string, lang string, keywordHint ...string) string {
 
 	for _, part := range parts[1:] {
 		code := strings.Split(part, "```")[0]
+		// Heuristic: If we are looking for the test, skip the block if it doesn't import "testing"
 		if len(keywordHint) > 0 {
-			if strings.Contains(strings.ToLower(code), keywordHint[0]) {
+			if strings.Contains(code, keywordHint[0]) || strings.Contains(code, "testing") {
 				return strings.TrimSpace(code)
 			}
 		} else {
-			return strings.TrimSpace(code)
+			// If we want the main code, assume it's the one that DOESN'T import "testing"
+			// (unless we only have one block)
+			if !strings.Contains(code, "testing") {
+				return strings.TrimSpace(code)
+			}
 		}
 	}
 
-	// Default to first block found
+	// Fallback: Just return the first block found if hints fail
 	return strings.TrimSpace(strings.Split(parts[1], "```")[0])
 }
