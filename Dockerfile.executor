@@ -1,0 +1,10 @@
+# Start small. Alpine is tiny and secure.
+FROM golang:1.25.4-alpine
+
+# Install build tools
+RUN apk add --no-cache git make build-base
+
+WORKDIR /workspace
+
+# By default, run tests in verbose mode
+CMD ["go", "test", "-v", "./..."]
