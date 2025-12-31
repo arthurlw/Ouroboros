@@ -1,45 +1,67 @@
-// EvolutionLoop runs the recursive self-improvement cycle.
-func (a *Agent) EvolutionLoop(goal string) error {
-	// 1. Context Injection: Load currently mastered skills into the LLM's context
-	currentTools := a.Registry.GetActiveMCPTools()
+package main
 
-	// 2. Planning: Ask LLM to plan the goal using *only* currentTools or request a *new* tool.
-	plan, err := a.Plan(goal, currentTools)
+import (
+	"context"
+	"flag"
+	"log/slog"
+	"os"
+	"ouroboros/internal/agent"
+	"ouroboros/internal/sandbox"
+	"ouroboros/internal/skills"
+	"path/filepath"
+)
+
+func main() {
+	// 1. CLI Parsing
+	goalPtr := flag.String("goal", "", "The objective for Ouroboros")
+	flag.Parse()
+
+	if *goalPtr == "" {
+		slog.Error("Please provide a goal using -goal 'Your Goal'")
+		os.Exit(1)
+	}
+
+	// 2. Setup Logging
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	// 3. Infrastructure Initialization
+	cwd, _ := os.Getwd()
+	libraryPath := filepath.Join(cwd, "skills_library")
+
+	// Modules
+	registry := skills.NewRegistry(libraryPath)
+
+	// Docker connection
+	gym, err := sandbox.NewSandbox("ouroboros-executor:latest", filepath.Join(libraryPath, "staging"))
 	if err != nil {
-		return err
+		slog.Error("Failed to connect to Docker", "error", err)
+		os.Exit(1)
 	}
 
-	for _, step := range plan.Steps {
-		// Case A: We have the tool. Execute it.
-		if step.ToolExists {
-			result, _ := a.ExecuteTool(step.ToolName, step.Args)
-			a.Evaluate(result)
-			continue
-		}
+	// AI Modules
+	llm := agent.NewClient() // Auto-detects Groq/OpenAI/Ollama
+	planner := agent.NewPlanner(llm)
+	critic := agent.NewCritic()
+	generator := agent.NewGenerator(llm)
 
-		// Case B: Tool missing. We must evolve.
-		// 3. Generation: Agent writes the implementation AND a test suite.
-		code, testSuite := a.GenerateTool(step.Requirement)
-
-		// 4. Critique (The "Ground Truth" Gatekeeper): Run in Docker.
-		sandboxResult, err := a.Sandbox.RunTest(code, testSuite)
-
-		if err != nil || !sandboxResult.Passed {
-			// Recursion: The agent reads the error and retries generation
-			// (You would add a retry limit here)
-			a.RefineTool(code, sandboxResult.Logs)
-		} else {
-			// 5. MCP Persistence: Promotion to Long-term Memory.
-			// Save the code to disk and update the MCP definition.
-			err := a.Registry.RegisterSkill(step.NewToolName, code, step.Description)
-			if err != nil {
-				return err // Handle persistence failure
-			}
-
-			// 6. Dynamic Re-injection: The loop restarts, but now 'currentTools'
-			// includes the new tool we just built.
-		}
+	// 4. Assemble Agent
+	ouroboros := &agent.Agent{
+		Planner:   planner,
+		Critic:    critic,
+		Sandbox:   gym,
+		Registry:  registry,
+		Generator: generator,
+		LLM:       llm,
+		Context:   context.Background(),
 	}
 
-	return nil
+	// 5. Start
+	slog.Info("🐍 OUROBOROS STARTUP COMPLETE", "goal", *goalPtr)
+	if err := ouroboros.EvolutionLoop(context.Background(), *goalPtr); err != nil {
+		slog.Error("Evolution Failed", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("🏁 GOAL ACCOMPLISHED")
 }

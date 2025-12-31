@@ -22,43 +22,53 @@ type Registry struct {
 	Tools       map[string]ToolDef
 }
 
+// NewRegistry initializes the skill memory.
 func NewRegistry(rootPath string) *Registry {
-	// Load existing tools from disk
+	// Ensure directories exist
+	verifiedPath := filepath.Join(rootPath, "verified")
+	os.MkdirAll(verifiedPath, 0755)
+
+	// Load existing tools (if any)
+	tools := make(map[string]ToolDef)
+	configPath := filepath.Join(rootPath, "mcp_config.json")
+
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = json.Unmarshal(data, &tools)
+	}
+
 	return &Registry{
-		LibraryPath: filepath.Join(rootPath, "verified"),
-		ConfigPath:  filepath.Join(rootPath, "mcp_config.json"),
-		Tools:       make(map[string]ToolDef),
+		LibraryPath: verifiedPath,
+		ConfigPath:  configPath,
+		Tools:       tools,
 	}
 }
 
 // RegisterTool promotes a staging script to a permanent MCP tool.
 func (r *Registry) RegisterTool(name, code, desc string) error {
-	// 1. Save the source code to the "verified" folder
-	filename := filepath.Join(r.LibraryPath, name, "main.go")
+	// 1. Create the specific tool directory
+	toolDir := filepath.Join(r.LibraryPath, name)
+	if err := os.MkdirAll(toolDir, 0755); err != nil {
+		return fmt.Errorf("failed to create tool dir: %w", err)
+	}
+
+	// 2. Save the source code
+	filename := filepath.Join(toolDir, "main.go")
 	if err := r.saveFile(filename, code); err != nil {
 		return err
 	}
 
-	// 2. Build the binary (We need it executable for MCP)
-	// (Implementation: Run "go build" via os/exec or the Sandbox)
-
 	// 3. Define the MCP Tool Schema
+	// For V1, we generate a generic schema that accepts a string argument.
 	tool := ToolDef{
 		Name:        name,
 		Description: desc,
-		InputSchema: generateJsonSchema(code), // Helper to reflectively gen schema
+		InputSchema: r.generateJsonSchema(),
 		Entrypoint:  filename,
 	}
 
 	// 4. Update Memory
 	r.Tools[name] = tool
 	return r.syncConfig()
-}
-
-// syncConfig writes the mcp.json file for external usage.
-func (r *Registry) syncConfig() error {
-	data, _ := json.MarshalIndent(r.Tools, "", "  ")
-	return os.WriteFile(r.ConfigPath, data, 0644)
 }
 
 // ListTools returns the tools for Context Injection.
@@ -68,4 +78,35 @@ func (r *Registry) ListTools() []ToolDef {
 		list = append(list, t)
 	}
 	return list
+}
+
+// GetActiveMCPTools is an alias for ListTools to match Interface requirements if needed
+func (r *Registry) GetActiveMCPTools() []ToolDef {
+	return r.ListTools()
+}
+
+// --- Helper Functions ---
+
+func (r *Registry) saveFile(path string, content string) error {
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+func (r *Registry) syncConfig() error {
+	data, _ := json.MarshalIndent(r.Tools, "", "  ")
+	return os.WriteFile(r.ConfigPath, data, 0644)
+}
+
+func (r *Registry) generateJsonSchema() json.RawMessage {
+	// A simple default schema for V1 tools
+	schema := `
+	{
+		"type": "object",
+		"properties": {
+			"args": {
+				"type": "string",
+				"description": "Arguments for the tool"
+			}
+		}
+	}`
+	return json.RawMessage(schema)
 }
