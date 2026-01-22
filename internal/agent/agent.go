@@ -171,6 +171,10 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 	code, test, err := a.Generator.GenerateCodeAndTest(ctx, step.Prompt, oldCode, oldTest)
 	if err != nil { return err }
 
+	// Sanitize: Remove unused imports
+	code = sanitizeImports(code)
+    test = sanitizeImports(test)
+
 	// Sanitize: Check test against implementation
 	test = sanitizeTestSuite(test, code)
 
@@ -299,6 +303,117 @@ func sanitizeTestSuite(testCode string, mainCode string) string {
 	}
 
 	return testCode
+}
+
+// sanitizeImports scans Go source code and removes unused imports to prevent compiler errors.
+func sanitizeImports(source string) string {
+	lines := strings.Split(source, "\n")
+
+	// Helper struct to track imports
+	type ImportDecl struct {
+		LineIndex int
+		PkgName   string
+		Original  string
+	}
+
+	var imports []ImportDecl
+
+	// Regex to parse: import "fmt" OR import foo "bar/baz"
+	// Captures: 1=Alias (optional), 2=Path
+	reImport := regexp.MustCompile(`^\s*(?:(\w+|_|\.)\s+)?"(.+)"`)
+
+	inImportBlock := false
+
+	// 1. SCAN: Find all imports
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect Import Block Start/End
+		if strings.HasPrefix(trimmed, "import (") {
+			inImportBlock = true
+			continue
+		}
+		if inImportBlock && strings.HasPrefix(trimmed, ")") {
+			inImportBlock = false
+			continue
+		}
+
+		// Check if this line is an import
+		isSingleImport := strings.HasPrefix(trimmed, "import ") && strings.Contains(trimmed, "\"")
+
+		if inImportBlock || isSingleImport {
+			cleanLine := trimmed
+			if isSingleImport {
+				cleanLine = strings.TrimPrefix(cleanLine, "import ")
+			}
+
+			matches := reImport.FindStringSubmatch(cleanLine)
+			if len(matches) > 0 {
+				alias := matches[1]
+				path := matches[2]
+
+				// Determine usage name
+				pkgName := ""
+				if alias != "" {
+					pkgName = alias
+				} else {
+					// Default: last element of path (e.g. "encoding/json" -> "json")
+					parts := strings.Split(path, "/")
+					pkgName = parts[len(parts)-1]
+				}
+
+				// SAFETY: Preserve side-effect imports (_) and dot imports (.)
+				// Dot imports are too risky to check via Regex because their functions look global.
+				if alias == "_" || alias == "." {
+					continue
+				}
+
+				imports = append(imports, ImportDecl{
+					LineIndex: i,
+					PkgName:   pkgName,
+					Original:  line,
+				})
+			}
+		}
+	}
+
+	// 2. CHECK: Build a "body" string excluding imports to check usage
+	var bodyBuilder strings.Builder
+	importLineIndices := make(map[int]bool)
+	for _, imp := range imports {
+		importLineIndices[imp.LineIndex] = true
+	}
+
+	for i, line := range lines {
+		// We skip the lines we identified as imports so we don't match the import itself
+		if !importLineIndices[i] {
+			bodyBuilder.WriteString(line + "\n")
+		}
+	}
+	body := bodyBuilder.String()
+
+	// 3. FILTER: Mark lines for removal
+	linesToRemove := make(map[int]bool)
+	for _, imp := range imports {
+		// Look for "PkgName." (e.g., "fmt.")
+		// \b ensures we don't match "fmt" inside "MyfmtFunction"
+		usageRe := regexp.MustCompile(fmt.Sprintf(`\b%s\.`, regexp.QuoteMeta(imp.PkgName)))
+
+		if !usageRe.MatchString(body) {
+			slog.Info("🧹 SANITIZER: Removing unused import", "package", imp.PkgName)
+			linesToRemove[imp.LineIndex] = true
+		}
+	}
+
+	// 4. REBUILD: Reconstruct the file
+	var result []string
+	for i, line := range lines {
+		if !linesToRemove[i] {
+			result = append(result, line)
+		}
+	}
+
+	return strings.Join(result, "\n")
 }
 
 func (a *Agent) optimizeSelf(ctx context.Context, step Step) error { return nil }
