@@ -2,8 +2,8 @@
 
 **A compiler-verified, LLM-based code synthesis system with persistent tool reuse.**
 
-> **Version:** 1.0 (Alpha)  
-> **Language:** Go (Golang)  
+> **Version:** 1.0 (Alpha)
+> **Language:** Go (Golang)
 > **Infrastructure:** Dockerized Sandbox, LLM Integration (Groq/Llama 3.3)
 
 ---
@@ -39,7 +39,7 @@ The system solves the issue of LLM hallucinations by trapping the model in a fee
 
 ## Phase 1
 
-Phase 1 focused on the implementation of the **Tool Builder Engine**. 
+Phase 1 focused on the implementation of the **Tool Builder Engine**.
 
 We have successfully established a stable feedback loop capable of self-generating, compiling, and verifying Go code. The system can now autonomously handle the lifecycle of tool creation—from receiving a prompt to persisting a compiled binary—without human intervention in the debugging loop, as well as use its tools to answer prompts.
 
