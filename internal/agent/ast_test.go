@@ -75,6 +75,85 @@ func Worker(data string) {
 	}
 }
 
+func TestParseFile_DeepInspection(t *testing.T) {
+	// 1. Setup: Create a single file with complex dependency logic
+	tmpDir := t.TempDir()
+	code := `
+package complex
+
+import (
+	"fmt"
+	"net/http"
+)
+
+// Controller calls Service and Logger
+func Controller() {
+	Service()
+	fmt.Println("Done")
+}
+
+// Service calls Repository and External API
+func Service() {
+	Repository()
+	http.Get("google.com")
+}
+
+func Repository() {
+	// Leaf node
+}
+`
+	path := filepath.Join(tmpDir, "complex.go")
+	if err := os.WriteFile(path, []byte(code), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Execution: Call the PRIVATE function 'parseFile' directly
+	// We can do this because we are in 'package agent' (white-box testing)
+	skel, err := parseFile(path)
+	if err != nil {
+		t.Fatalf("parseFile failed: %v", err)
+	}
+
+	// 3. Verification: Check the struct fields directly (No string parsing!)
+
+	// A. Check Package Name
+	if skel.Package != "complex" {
+		t.Errorf("Expected package 'complex', got '%s'", skel.Package)
+	}
+
+	// B. Check Function Discovery
+	if len(skel.Functions) != 3 {
+		t.Errorf("Expected 3 functions, got %d", len(skel.Functions))
+	}
+
+	// C. Check Dependency Graph (The "Math" Part)
+	// We expect: Controller -> [Service, fmt.Println]
+	deps := skel.Dependencies["Controller"]
+
+	// Helper to check slice containment
+	assertContains := func(list []string, target string) {
+		found := false
+		for _, item := range list {
+			if item == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Controller dependency list missing '%s'. Got: %v", target, list)
+		}
+	}
+
+	assertContains(deps, "Service")
+	assertContains(deps, "fmt.Println")
+
+	// D. Check Nested Dependencies
+	// We expect: Service -> [Repository, http.Get]
+	serviceDeps := skel.Dependencies["Service"]
+	assertContains(serviceDeps, "http.Get")
+	assertContains(serviceDeps, "Repository")
+}
+
 // Helper to find the text block for a specific function to ensure we aren't matching
 // calls from the wrong function.
 func extractBlock(fullText, funcHeader string) string {
