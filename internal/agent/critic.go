@@ -4,37 +4,43 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"ouroboros/internal/sandbox"
 	"strings"
+
+	"github.com/arthurlw/ouroboros/internal/sandbox"
 )
 
-// StandardCritic evaluates the results from the Gym.
+// StandardCritic evaluates the results from the sandbox.
 type StandardCritic struct{}
 
 func NewCritic() *StandardCritic {
 	return &StandardCritic{}
 }
 
-func (c *StandardCritic) Verify(ctx context.Context, res *sandbox.Result) (bool, string) {
+// Verify analyzes test results and returns (passed, failureKind, feedback)
+func (c *StandardCritic) Verify(ctx context.Context, res *sandbox.Result) (bool, sandbox.FailureKind, string) {
 	if res.ExitCode == 0 {
-		return true, "Tests passed."
+		return true, sandbox.FailureNone, "Tests passed."
 	}
 
-	// Analyze failure
+	// Check for timeout first (may be set by runContainer)
+	if res.FailureKind == sandbox.FailureTimeout {
+		slog.Error("Detected TIMEOUT")
+		return false, sandbox.FailureTimeout, "EXECUTION TIMEOUT"
+	}
+
+	// Analyze failure types
 	if strings.Contains(res.Stderr, "build failed") {
 		slog.Error("Detected BUILD FAILURE")
-		return false, fmt.Sprintf("COMPILER ERROR:\n%s", res.Stderr)
+		res.FailureKind = sandbox.FailureBuild
+		return false, sandbox.FailureBuild, fmt.Sprintf("COMPILER ERROR:\n%s", res.Stderr)
 	}
 
 	if strings.Contains(res.Stdout, "FAIL:") || strings.Contains(res.Stdout, "--- FAIL") {
 		slog.Error("Detected TEST FAILURE")
-		return false, fmt.Sprintf("TEST FAILURE:\n%s", res.Stdout)
+		res.FailureKind = sandbox.FailureTest
+		return false, sandbox.FailureTest, fmt.Sprintf("TEST FAILURE:\n%s", res.Stdout)
 	}
 
-	if res.ExitCode == 124 {
-		slog.Error("Detected TIMEOUT")
-		return false, "EXECUTION TIMEOUT"
-	}
-
-	return false, fmt.Sprintf("UNKNOWN ERROR (Exit %d):\n%s\n%s", res.ExitCode, res.Stdout, res.Stderr)
+	res.FailureKind = sandbox.FailureUnknown
+	return false, sandbox.FailureUnknown, fmt.Sprintf("UNKNOWN ERROR (Exit %d):\n%s\n%s", res.ExitCode, res.Stdout, res.Stderr)
 }

@@ -1,72 +1,385 @@
-# Project Ouroboros
+# Ouroboros 🐍
 
-**A compiler-verified, LLM-based code synthesis system with persistent tool reuse.**
+**A compiler-verified LLM code-synthesis agent that builds, tests, and evolves executable Go tools autonomously.**
 
-> **Version:** 1.0 (Alpha)
-> **Language:** Go (Golang)
-> **Infrastructure:** Dockerized Sandbox, LLM Integration (Groq/Llama 3.3)
-
----
-
-## 1. Summary
-
-Ouroboros is a goal-driven execution harness for LLMs. Unlike standard chatbots which generate static text, Ouroboros functions as a rigorous build system that generates **executable capabilities**.
-
-When given a goal, it plans a software solution, writes the source code, compiles it, tests it within a secure environment, and iterates until the code compiles and passes verification.
-
-Unlike ephemeral agents, Ouroboros can use its created tools to answer prompts and implements **persistent tool reuse**. Once it builds a functioning tool, it serializes it to a local registry (`skills_library`). This allows the system to rehydrate context and refactor existing logic in future tasks without rebuilding tools from scratch.
+[![CI](https://github.com/arthurlw/ouroboros/workflows/CI/badge.svg)](https://github.com/arthurlw/ouroboros/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/arthurlw/ouroboros)](https://goreportcard.com/report/github.com/arthurlw/ouroboros)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go Version](https://img.shields.io/badge/Go-1.24%2B-blue)](https://go.dev/)
 
 ---
 
-## 2. System Architecture
+## What is Ouroboros?
 
-Ouroboros operates on a cyclical **"Plan-Build-Test-Execute"** loop. It is architected as a compiled Go binary that orchestrates an LLM inference engine and a Docker execution environment.
+Unlike standard LLM coding assistants that generate static text, **Ouroboros** is a rigorous build system that:
+
+1. 📋 **Plans** - Breaks your goal into atomic implementation steps
+2. 🔨 **Generates** - Writes Go source code + comprehensive tests
+3. ✅ **Verifies** - Compiles and tests in isolated Docker containers
+4. 🔄 **Evolves** - Refines code through feedback loops until tests pass
+5. 💾 **Persists** - Saves verified tools for reuse (no context loss!)
+
+**Key Differentiator**: Ouroboros enforces *compiler and test verification* on every generated tool before accepting it. No more hallucinated code that doesn't compile.
+
+---
+
+## Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/arthurlw/ouroboros.git
+cd ouroboros
+
+# Build the Docker executor image
+docker build -f Dockerfile.executor -t ouroboros-executor:latest .
+
+# Build Ouroboros
+make build
+
+# Or install directly
+make install
+```
+
+### Set Up Your LLM Provider
+
+Ouroboros supports multiple providers (choose one):
+
+```bash
+# Anthropic Claude (recommended)
+export ANTHROPIC_API_KEY="your-key-here"
+
+# OR Groq (fast, generous free tier)
+export GROQ_API_KEY="your-key-here"
+
+# OR OpenAI
+export OPENAI_API_KEY="your-key-here"
+
+# OR Ollama (local, no API key needed)
+# Just run: ollama serve
+```
+
+### Run Your First Goal
+
+```bash
+./bin/ouroboros -goal "calculate the 100th fibonacci number"
+```
+
+Ouroboros will:
+1. Plan the implementation
+2. Generate Go code with memoization
+3. Write comprehensive tests
+4. Verify in Docker sandbox
+5. Execute and return the result
+
+---
+
+## Architecture
+
+```mermaid
+graph TB
+    A[User Goal] --> B[Planner]
+    B --> C{Tool Exists?}
+    C -->|Yes| D[Load Existing Tool]
+    C -->|No| E[Generator]
+    E --> F[Generate Code + Tests]
+    F --> G[Sandbox: Docker]
+    G --> H[Compiler]
+    H --> I{Build Success?}
+    I -->|No| J[Critic: Analyze Error]
+    J --> E
+    I -->|Yes| K[Run Tests]
+    K --> L{Tests Pass?}
+    L -->|No| J
+    L -->|Yes| M[Registry: Save Tool]
+    M --> N[Execute Tool]
+    D --> N
+    N --> O[Return Result]
+```
 
 ### Core Components
 
-* **The Planner:** Analyzes the user's high-level goal and breaks it down into atomic steps. It queries the `skills_library` first—if a tool exists, it assigns a "Refactor" task; if not, it assigns a "Create" task.
-* **The Registry:** A file-system-based storage mechanism where verified tools reside. This serves as a regression guard; before generating code, the system checks this registry to ensure optimized logic is not overwritten by boilerplate.
-* **The Generator:** Produces Go source code (`main.go`) and test suites (`main_test.go`). It is context-aware, distinguishing between "New Tool" mode and "Refactor" mode.
-* **The Sandbox:** An ephemeral Docker Container that mounts the code, compiles it, and runs tests. This allows Ouroboros to execute operations like port scanning or file I/O without risking the host machine.
-* **The Critic:** Parses raw compiler logs and test output. If a tool fails, it generates specific, structured feedback (e.g., "Test failed on line 42: Index out of range") to guide the next generation cycle.
-
-### The Convergence Loop
-The system solves the issue of LLM hallucinations by trapping the model in a feedback loop until verification succeeds:
-1.  **Ping-Pong Strategy:** Alternates focus between fixing `main.go` (Implementation) and `main_test.go` (Test Suite) to prevent logical deadlocks.
-2.  **Smart Sanitization:** Uses Regex-based filtering to strip duplicate functions and prevent "Redeclaration Errors" common in LLM outputs.
+| Component | Purpose | File |
+|-----------|---------|------|
+| **Planner** | Decomposes goals into atomic steps | `internal/agent/planner.go` |
+| **Generator** | Produces Go code + unit tests | `internal/agent/generator.go` |
+| **Critic** | Analyzes build/test failures | `internal/agent/critic.go` |
+| **Sandbox** | Executes code in isolated Docker containers | `internal/sandbox/docker.go` |
+| **Registry** | Manages persistent tool library | `internal/skills/mcp.go` |
+| **LLM Providers** | Anthropic, Groq, OpenAI, Ollama | `internal/llm/*.go` |
 
 ---
 
-## Phase 1
+## How It Works: The Evolution Loop
 
-Phase 1 focused on the implementation of the **Tool Builder Engine**.
+Ouroboros uses a **convergence loop** with a maximum retry budget (default: 6 attempts):
 
-We have successfully established a stable feedback loop capable of self-generating, compiling, and verifying Go code. The system can now autonomously handle the lifecycle of tool creation—from receiving a prompt to persisting a compiled binary—without human intervention in the debugging loop, as well as use its tools to answer prompts.
+1. **Generate** → LLM creates `main.go` + `main_test.go`
+2. **Sanitize** → AST-based deduplication removes collisions
+3. **Build** → `goimports` + `go test` in Docker
+4. **Verify** → Critic classifies failures (Build/Test/Timeout)
+5. **Refine** → Targeted fixes:
+   - Build failures → Fix implementation OR tests
+   - Test failures → Alternate between code and test fixes
+   - Timeouts → Simplify implementation
+6. **Repeat** → Until tests pass or budget exhausted
+
+If successful, the tool is registered to `skills_library/verified/<tool>/` for future reuse.
 
 ---
 
-## Phase 2
+## Features
 
-The objective of Phase 2 is to enable **Surgical Debugging**. The system must be able to read, debug, and patch its own core source code without needing to ingest the entire repository context.
+### ✅ Compiler-Verified Code Generation
+- No hallucinated code ships to production
+- AST-based sanitization prevents duplicate functions
+- Automatic import management with `goimports`
 
-### The Challenge: Context Management
-Feeding the entire Ouroboros source code into the LLM context window is inefficient and leads to "context explosion," degrading the model's reasoning capabilities.
+### 🔄 Smart Retry with Exponential Backoff
+- Handles rate limits (429) and server errors (5xx)
+- Backoff: 1s → 2s → 4s → 8s (configurable)
 
-### The Solution: Introspection Tools
-To solve this, the Ouroboros engine was tasked with creating its own debugging utilities. By mounting the Docker container on the host's source code, the system built a two-step mechanism to facilitate "self-reading" without token bloat:
+### 🛡️ Regression Guard
+- Existing tools are never overwritten accidentally
+- Enforces `ExistingTool=true` when tool already exists
 
-**1. The Skeleton Tool (`map_project`)**
-* **Function:** Generates a lightweight directory tree of the project (Repo Root + Short Summary of each file).
-* **Utility:** Allows the Planner to visualize the project architecture and locate relevant logic files without reading their contents.
+### 📦 Persistent Tool Library
+- Verified tools saved to `skills_library/verified/`
+- MCP-compatible schema for future IDE integration
+- Version-aware storage (roadmap)
 
-**2. The Reader Tool (`read_file`)**
-* **Function:** Targeted file reading (similar to `claude code`).
-* **Utility:** Allows the Planner to read specific files on demand.
+### 🐳 Sandboxed Execution
+- Isolated Docker containers (no network, limited resources)
+- Timeout protection (45s for tests, 30s for execution)
+- Automatic cleanup
 
-**The Introspection Workflow:**
-1.  **Ingest:** The container mounts the project source.
-2.  **Map:** The system runs `map_project` to understand the file structure.
-3.  **Correlate:** It matches runtime logs to specific files in the map.
-4.  **Read:** It runs `read_file` to ingest *only* the specific file identified as buggy.
-5.  **Patch:** It generates a fix based on this high-precision, low-noise context.
+### 🎯 Multiple LLM Providers
+- **Anthropic**: Claude Sonnet 4 (best quality)
+- **Groq**: Llama 3.3 70B (fastest)
+- **OpenAI**: GPT-4o (proven reliability)
+- **Ollama**: Qwen 2.5 Coder 7B (local, private)
 
+### 🔍 Typed Failure Taxonomy
+- `FailureBuild` → Compiler errors
+- `FailureTest` → Test failures
+- `FailureTimeout` → Execution timeouts
+- `FailureUnknown` → Other errors
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | Anthropic Claude API key | - |
+| `GROQ_API_KEY` | Groq API key | - |
+| `OPENAI_API_KEY` | OpenAI API key | - |
+| `OLLAMA_HOST` | Ollama server address | `http://localhost:11434` |
+
+### Command-Line Flags
+
+```bash
+ouroboros [flags]
+
+Flags:
+  -goal string
+        The objective for Ouroboros to accomplish (required)
+```
+
+### Future Flags (Roadmap)
+
+```bash
+  -max-tokens int
+        Maximum tokens budget for LLM calls
+  -max-cost-usd float
+        Maximum cost budget in USD
+  -verbose
+        Enable verbose logging with token counts
+  -record string
+        Record LLM interactions to directory
+  -replay string
+        Replay from recorded directory (deterministic)
+```
+
+---
+
+## Example Usage
+
+### Basic Computation
+
+```bash
+$ ./bin/ouroboros -goal "compute the SHA-256 hash of 'hello world'"
+
+🧠 Using Provider: GROQ (Llama 3.3 70B)
+🔵 PLAN GENERATED (steps: 1)
+✨ CREATING NEW TOOL (tool: sha256_hasher)
+🔄 ITERATION 1/6
+🟢 TOOL VERIFIED (name: sha256_hasher)
+🏁 FINAL EXECUTION
+
+💬 OUROBOROS SAYS:
+The SHA-256 hash of 'hello world' is:
+b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+```
+
+### File Processing
+
+```bash
+$ ./bin/ouroboros -goal "count the number of Go files in the current directory"
+
+# Ouroboros will create a file scanner tool and execute it
+```
+
+### Using Existing Tools
+
+```bash
+$ ./bin/ouroboros -goal "scan ports 80 and 443 on localhost"
+
+🛡️ REGRESSION GUARD: Tool exists. Enforcing ExistingTool=true
+🛠️ USING TOOL (tool: port_scanner)
+🔍 RAW TOOL OUTPUT
+
+💬 OUROBOROS SAYS:
+Port 80: closed
+Port 443: closed
+```
+
+---
+
+## Development
+
+### Running Tests
+
+```bash
+# All tests
+make test
+
+# With race detector
+make test-race
+
+# Coverage report
+make coverage
+```
+
+### Code Quality
+
+```bash
+# Format code
+make fmt
+
+# Run linters (go vet + staticcheck)
+make lint
+
+# Full pre-release check
+make release-check
+```
+
+### Building Release Binaries
+
+```bash
+make release
+
+# Outputs:
+# bin/release/ouroboros-linux-amd64
+# bin/release/ouroboros-linux-arm64
+# bin/release/ouroboros-darwin-amd64
+# bin/release/ouroboros-darwin-arm64 (Apple Silicon)
+# bin/release/ouroboros-windows-amd64.exe
+```
+
+---
+
+## Roadmap
+
+### Phase 1: Architecture Cleanup *(In Progress)*
+- [x] Refactor LLM providers into `internal/llm/`
+- [x] Add retry with exponential backoff
+- [x] Enforce regression guard
+- [x] Validate tool names
+- [ ] Add observability (trace IDs, token tracking, cost tracking)
+- [ ] Budget guards (`--max-tokens`, `--max-cost-usd`)
+- [ ] Record/replay mode for debugging
+- [ ] Versioned tool storage (`v1`, `v2`, etc.)
+
+### Phase 2: SWE-Bench Ready
+- [ ] Repo-ingest mode with AST symbol indexing
+- [ ] BM25 search for relevant files
+- [ ] Patch generation mode (unified diff)
+- [ ] Multi-language support (Python, Node.js sandboxes)
+- [ ] SWE-Bench Lite evaluation harness
+
+### Phase 3: Production Hardening *(Completed)*
+- [x] MIT License
+- [x] GitHub Actions CI (Go 1.24/1.25, Linux/macOS)
+- [x] CodeQL security scanning
+- [x] Comprehensive Makefile
+- [x] CONTRIBUTING.md
+- [x] Issue/PR templates
+
+### Future Vision
+- MCP Server for Claude Desktop/Cursor integration
+- WebAssembly sandbox for browser execution
+- Multi-agent collaboration (parallel tool development)
+- Self-improvement mode (Ouroboros optimizing its own codebase)
+
+---
+
+## FAQ
+
+**Q: How is this different from Cursor/Copilot/Aider?**
+A: Those are assistants. Ouroboros is an autonomous *build system* with compiler verification. It won't accept code that doesn't compile and pass tests.
+
+**Q: Does it work offline?**
+A: Yes! Use Ollama as your provider (runs locally, no internet required).
+
+**Q: How much does it cost?**
+A: Depends on your provider:
+- **Groq**: Generous free tier (~100 requests/day)
+- **Ollama**: Free (local)
+- **Anthropic/OpenAI**: Pay-per-token (~$0.01-0.10 per goal)
+
+**Q: Can I use it for production code?**
+A: The verification loop makes it safer than raw LLM output, but always review generated code. Best for prototyping, scripts, and utilities.
+
+**Q: Why Go only?**
+A: Go's fast compilation and strong typing make it ideal for verified code generation. Python/Node support is on the roadmap.
+
+---
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for:
+- Development setup
+- Coding standards
+- How to add new LLM providers
+- Pull request process
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Acknowledgments
+
+- Inspired by the SWE-Bench evaluation framework
+- Built on the shoulders of giants: Go, Docker, and modern LLMs
+- Special thanks to the open-source community
+
+---
+
+## Support
+
+- **Issues**: [GitHub Issues](https://github.com/arthurlw/ouroboros/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/arthurlw/ouroboros/discussions)
+
+---
+
+<p align="center">
+  <strong>Built with ❤️ and 🤖</strong>
+</p>

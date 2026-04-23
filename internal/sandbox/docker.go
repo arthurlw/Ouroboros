@@ -15,11 +15,37 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
+type FailureKind int
+
+const (
+	FailureNone FailureKind = iota
+	FailureBuild
+	FailureTest
+	FailureTimeout
+	FailureUnknown
+)
+
+func (f FailureKind) String() string {
+	switch f {
+	case FailureNone:
+		return "None"
+	case FailureBuild:
+		return "BuildFailure"
+	case FailureTest:
+		return "TestFailure"
+	case FailureTimeout:
+		return "Timeout"
+	default:
+		return "Unknown"
+	}
+}
+
 type Result struct {
-	ExitCode int64
-	Stdout   string
-	Stderr   string
-	Passed   bool
+	ExitCode    int64
+	Stdout      string
+	Stderr      string
+	Passed      bool
+	FailureKind FailureKind
 }
 
 type Client struct {
@@ -50,23 +76,24 @@ func NewSandbox(image string, stagingDir string) (*Client, error) {
 	}, nil
 }
 
-// ExecuteTest runs "go test"
+// ExecuteTest runs "goimports" then "go test"
 func (s *Client) ExecuteTest(ctx context.Context, code string, test string) (*Result, error) {
 	if err := s.writeToStaging("main.go", code); err != nil { return nil, err }
 	if err := s.writeToStaging("main_test.go", test); err != nil { return nil, err }
-	if err := s.writeToStaging("go.mod", "module generated\n\ngo 1.23\n"); err != nil { return nil, err }
+	if err := s.writeToStaging("go.mod", fmt.Sprintf("module generated\n\ngo %s\n", GoVersion)); err != nil { return nil, err }
 
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	return s.runContainer(ctx, []string{"go", "test", "-v", "./..."})
+	// Run goimports first to fix imports, then run tests
+	return s.runContainer(ctx, []string{"sh", "-c", "goimports -w main.go main_test.go && go test -v ./..."})
 }
 
 // RunTool writes the code and runs "go run main.go [args]"
 func (s *Client) RunTool(ctx context.Context, code string, args []string) (*Result, error) {
 	// 1. Write the latest code
 	if err := s.writeToStaging("main.go", code); err != nil { return nil, err }
-	if err := s.writeToStaging("go.mod", "module generated\n\ngo 1.23\n"); err != nil { return nil, err }
+	if err := s.writeToStaging("go.mod", fmt.Sprintf("module generated\n\ngo %s\n", GoVersion)); err != nil { return nil, err }
 
 	// 2. Run with timeout
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -123,16 +150,28 @@ func (s *Client) runContainer(ctx context.Context, cmd []string) (*Result, error
 
 	statusCh, errCh := s.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	select {
-	case err := <-errCh: return nil, err
+	case err := <-errCh:
+		return nil, err
 	case status := <-statusCh:
-		return &Result{
+		result := &Result{
 			ExitCode: status.StatusCode,
 			Stdout:   stdoutBuf.String(),
 			Stderr:   stderrBuf.String(),
 			Passed:   status.StatusCode == 0,
-		}, nil
+		}
+		if status.StatusCode == 0 {
+			result.FailureKind = FailureNone
+		}
+		return result, nil
 	case <-ctx.Done():
 		s.cli.ContainerKill(context.Background(), resp.ID, "SIGKILL")
-		return nil, ctx.Err()
+		// Return a Result with timeout information
+		return &Result{
+			ExitCode:    -1,
+			Stdout:      stdoutBuf.String(),
+			Stderr:      "timeout",
+			Passed:      false,
+			FailureKind: FailureTimeout,
+		}, fmt.Errorf("container execution timed out")
 	}
 }

@@ -3,12 +3,17 @@ package agent
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"os"
-	"ouroboros/internal/sandbox"
-	"ouroboros/internal/skills"
 	"path/filepath"
+
+	"github.com/arthurlw/ouroboros/internal/sandbox"
+	"github.com/arthurlw/ouroboros/internal/skills"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -49,7 +54,8 @@ func (a *Agent) EvolutionLoop(ctx context.Context, goal string) error {
 		}
 
 		if toolExists && !step.ExistingTool {
-			slog.Info("🛡️ REGRESSION GUARD: Tool exists. Forcing Planner to respect existing code.", "tool", step.ToolName)
+			slog.Info("🛡️ REGRESSION GUARD: Tool exists. Enforcing ExistingTool=true and loading existing code.", "tool", step.ToolName)
+			step.ExistingTool = true
 		}
 
 		if step.ExistingTool && !step.IsSelfImprovement {
@@ -107,6 +113,11 @@ func (a *Agent) executeToolStep(ctx context.Context, toolName string, goal strin
 }
 
 func (a *Agent) extractArgs(goal string) ([]string, error) {
+	// Short-circuit if goal clearly has no arguments
+	if !hasLikelyArgs(goal) {
+		return []string{}, nil
+	}
+
 	prompt := fmt.Sprintf(`
 GOAL: "%s"
 INSTRUCTION: Extract the input arguments needed for a command-line tool.
@@ -116,7 +127,7 @@ EXAMPLE 3: "Check system info" -> "none"
 OUTPUT FORMAT: Return ONLY the arguments separated by spaces. If none, return "none". Do not use quotes.
 `, goal)
 
-	raw, err := a.LLM.Generate(a.Context, prompt)
+	raw, err := a.LLM.Generate(a.Context, prompt, "")
 	if err != nil { return nil, err }
 
 	cleaned := strings.TrimSpace(raw)
@@ -125,11 +136,31 @@ OUTPUT FORMAT: Return ONLY the arguments separated by spaces. If none, return "n
 		return []string{}, nil
 	}
 
+	// Reject any output with angle brackets or braces (likely LLM artifacts)
 	if strings.Contains(cleaned, "<") || strings.Contains(cleaned, "{") {
 		return []string{}, nil
 	}
 
-	return strings.Split(cleaned, " "), nil
+	args := strings.Split(cleaned, " ")
+
+	// Sanitize: reject shell metacharacters for security
+	dangerousChars := []string{";", "|", "&", "`", "$", "\n", "\r"}
+	for _, arg := range args {
+		for _, char := range dangerousChars {
+			if strings.Contains(arg, char) {
+				slog.Warn("⚠️ extractArgs: Rejected argument with shell metacharacter", "arg", arg, "char", char)
+				return []string{}, fmt.Errorf("argument contains dangerous character: %s", char)
+			}
+		}
+	}
+
+	return args, nil
+}
+
+// hasLikelyArgs checks if a goal string likely contains arguments
+func hasLikelyArgs(goal string) bool {
+	// Look for numbers or quoted strings that suggest arguments
+	return regexp.MustCompile(`\d+|"[^"]+"|'[^']+'`).MatchString(goal)
 }
 
 func (a *Agent) SynthesizeResult(goal string, rawOutput string) (string, error) {
@@ -147,7 +178,7 @@ INSTRUCTIONS:
 5. STRICTLY NO JSON. Plain text only.
 `, goal, rawOutput)
 
-	resp, err := a.LLM.Generate(a.Context, prompt)
+	resp, err := a.LLM.Generate(a.Context, prompt, "You are Ouroboros. STRICTLY NO JSON. Plain text only.")
 	if strings.HasPrefix(strings.TrimSpace(resp), "{") {
 		return resp, err
 	}
@@ -171,33 +202,49 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 	code, test, err := a.Generator.GenerateCodeAndTest(ctx, step.Prompt, oldCode, oldTest)
 	if err != nil { return err }
 
-	// Sanitize: Remove unused imports
-	code = sanitizeImports(code)
-    test = sanitizeImports(test)
-
-	// Sanitize: Check test against implementation
+	// Sanitize: Check test against implementation (goimports handles import cleanup)
 	test = sanitizeTestSuite(test, code)
 
 	for i := 0; i < budget.MaxRetries; i++ {
 		slog.Info("🔄 ITERATION", "current", i+1, "max", budget.MaxRetries)
+		isLastIteration := i == budget.MaxRetries-1
 
 		result, err := a.Sandbox.ExecuteTest(ctx, code, test)
-		if err != nil { return fmt.Errorf("sandbox fatal error: %w", err) }
 
-		passed, feedback := a.Critic.Verify(ctx, result)
+		// Handle sandbox errors (including timeout)
+		if err != nil {
+			if result != nil && result.FailureKind == sandbox.FailureTimeout {
+				if isLastIteration {
+					slog.Error("❌ CONVERGENCE FAILED: Timeout on final iteration.")
+					return fmt.Errorf("tool failed to converge after %d attempts (last failure: timeout)", budget.MaxRetries)
+				}
+				slog.Warn("🔴 TIMEOUT - Retrying with simpler implementation")
+				code, err = a.refineImplementation(code, test, "Code execution timed out. Simplify the implementation or reduce complexity.")
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("sandbox fatal error: %w", err)
+		}
+
+		passed, failureKind, feedback := a.Critic.Verify(ctx, result)
 		if passed {
 			slog.Info("🟢 TOOL VERIFIED", "name", step.ToolName)
 			return a.Registry.RegisterTool(step.ToolName, code, step.Description)
 		}
 
-		if i == budget.MaxRetries-1 {
-			slog.Error("❌ CONVERGENCE FAILED: Budget Exhausted.")
-			return fmt.Errorf("tool failed to converge after %d attempts", budget.MaxRetries)
+		if isLastIteration {
+			slog.Error("❌ CONVERGENCE FAILED: Budget Exhausted.", "last_kind", failureKind.String())
+			return fmt.Errorf("tool failed to converge after %d attempts (last failure: %s)", budget.MaxRetries, failureKind)
 		}
 
-		slog.Warn("🔴 TEST FAILED", "reason", feedback)
+		slog.Warn("🔴 TEST FAILED", "kind", failureKind.String(), "reason", feedback)
 
-		if strings.Contains(feedback, "[build failed]") {
+		// Route refinement based on failure type
+		switch failureKind {
+		case sandbox.FailureBuild:
+			// For build failures, check if it's in main.go or main_test.go
 			if strings.Contains(feedback, "main.go") {
 				code, err = a.refineImplementation(code, test, feedback)
 			} else if strings.Contains(feedback, "main_test.go") {
@@ -205,7 +252,11 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 			} else {
 				code, err = a.refineImplementation(code, test, feedback)
 			}
-		} else {
+		case sandbox.FailureTimeout:
+			slog.Info("🔧 SIMPLIFYING IMPLEMENTATION (Timeout)")
+			code, err = a.refineImplementation(code, test, feedback)
+		default:
+			// For test failures and unknown errors, alternate between fixing code and tests
 			if i%2 == 0 {
 				slog.Info("🔧 REFINING IMPLEMENTATION (Aligning Code to Test)")
 				code, err = a.refineImplementation(code, test, feedback)
@@ -217,7 +268,7 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 
 		if err != nil { return err }
 	}
-	return nil
+	return fmt.Errorf("evolve loop exited unexpectedly") // defensive — should be unreachable
 }
 
 func (a *Agent) refineImplementation(code string, test string, feedback string) (string, error) {
@@ -241,7 +292,7 @@ INSTRUCTIONS:
 4. RETURN ONLY the raw Go code for main.go inside a markdown block.
 `, code, test, feedback)
 
-	newCode, err := a.LLM.Generate(a.Context, prompt)
+	newCode, err := a.LLM.Generate(a.Context, prompt, "You are a Senior Go Developer. Return code in markdown blocks.")
 	if err != nil { return "", err }
 	return extractBlock(newCode, "go"), nil
 }
@@ -268,152 +319,99 @@ INSTRUCTIONS:
 5. RETURN ONLY the raw Go code for main_test.go inside a markdown block.
 `, code, test, feedback)
 
-	newTest, err := a.LLM.Generate(a.Context, prompt)
+	newTest, err := a.LLM.Generate(a.Context, prompt, "You are a Senior Go Developer. Return code in markdown blocks.")
 	if err != nil { return "", err }
 
 	raw := extractBlock(newTest, "go")
 	return sanitizeTestSuite(raw, code), nil
 }
 
-// sanitizeTestSuite: THE SMART DEDUPLICATOR
+// sanitizeTestSuite: AST-based deduplicator
+// Removes function declarations from test code that collide with functions in main code
 func sanitizeTestSuite(testCode string, mainCode string) string {
-
-	// 1. Extract function names from main.go
-	// Regex matches: func FunctionName(
-	reFunc := regexp.MustCompile(`func\s+([A-Za-z0-9_]+)\(`)
-	mainMatches := reFunc.FindAllStringSubmatch(mainCode, -1)
-
-	// 2. Iterate through main functions and check if they exist in test
-	for _, match := range mainMatches {
-		funcName := match[1]
-
-		// Skip sanitizing Test/Benchmark functions if they somehow appear in main
-		if strings.HasPrefix(funcName, "Test") || strings.HasPrefix(funcName, "Benchmark") {
-			continue
-		}
-
-		// Regex to find "func FunctionName(" in test code
-		reCollision := regexp.MustCompile(fmt.Sprintf(`func\s+%s\s*\(`, funcName))
-
-		if reCollision.MatchString(testCode) {
-			slog.Warn("⚠️ SANITIZER: Detected duplicate function in test file. Removing...", "func", funcName)
-			// Replace "func Name(" with "// func Name( [DUPLICATE REMOVED]"
-			testCode = reCollision.ReplaceAllString(testCode, fmt.Sprintf("// func %s( [DUPLICATE REMOVED]", funcName))
-		}
+	// Parse main.go to extract exported function names
+	mainFuncs := extractFunctionNames(mainCode)
+	if len(mainFuncs) == 0 {
+		return testCode // Nothing to sanitize
 	}
 
-	return testCode
-}
-
-// sanitizeImports scans Go source code and removes unused imports to prevent compiler errors.
-func sanitizeImports(source string) string {
-	lines := strings.Split(source, "\n")
-
-	// Helper struct to track imports
-	type ImportDecl struct {
-		LineIndex int
-		PkgName   string
-		Original  string
+	// Parse test code
+	fset := token.NewFileSet()
+	testNode, err := parser.ParseFile(fset, "main_test.go", testCode, parser.ParseComments)
+	if err != nil {
+		slog.Warn("⚠️ SANITIZER: Failed to parse test code, skipping sanitization", "error", err)
+		return testCode
 	}
 
-	var imports []ImportDecl
+	// Track byte ranges to remove
+	type removal struct {
+		start int
+		end   int
+		name  string
+	}
+	var toRemove []removal
 
-	// Regex to parse: import "fmt" OR import foo "bar/baz"
-	// Captures: 1=Alias (optional), 2=Path
-	reImport := regexp.MustCompile(`^\s*(?:(\w+|_|\.)\s+)?"(.+)"`)
+	// Find colliding function declarations
+	for _, decl := range testNode.Decls {
+		if funcDecl, ok := decl.(*ast.FuncDecl); ok {
+			funcName := funcDecl.Name.Name
 
-	inImportBlock := false
-
-	// 1. SCAN: Find all imports
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Detect Import Block Start/End
-		if strings.HasPrefix(trimmed, "import (") {
-			inImportBlock = true
-			continue
-		}
-		if inImportBlock && strings.HasPrefix(trimmed, ")") {
-			inImportBlock = false
-			continue
-		}
-
-		// Check if this line is an import
-		isSingleImport := strings.HasPrefix(trimmed, "import ") && strings.Contains(trimmed, "\"")
-
-		if inImportBlock || isSingleImport {
-			cleanLine := trimmed
-			if isSingleImport {
-				cleanLine = strings.TrimPrefix(cleanLine, "import ")
+			// Skip Test/Benchmark functions
+			if strings.HasPrefix(funcName, "Test") || strings.HasPrefix(funcName, "Benchmark") {
+				continue
 			}
 
-			matches := reImport.FindStringSubmatch(cleanLine)
-			if len(matches) > 0 {
-				alias := matches[1]
-				path := matches[2]
-
-				// Determine usage name
-				pkgName := ""
-				if alias != "" {
-					pkgName = alias
-				} else {
-					// Default: last element of path (e.g. "encoding/json" -> "json")
-					parts := strings.Split(path, "/")
-					pkgName = parts[len(parts)-1]
-				}
-
-				// SAFETY: Preserve side-effect imports (_) and dot imports (.)
-				// Dot imports are too risky to check via Regex because their functions look global.
-				if alias == "_" || alias == "." {
-					continue
-				}
-
-				imports = append(imports, ImportDecl{
-					LineIndex: i,
-					PkgName:   pkgName,
-					Original:  line,
+			// Check for collision
+			if mainFuncs[funcName] {
+				slog.Warn("⚠️ SANITIZER: Detected duplicate function in test file. Removing entire declaration...", "func", funcName)
+				toRemove = append(toRemove, removal{
+					start: int(funcDecl.Pos() - 1), // Convert to 0-based
+					end:   int(funcDecl.End() - 1),
+					name:  funcName,
 				})
 			}
 		}
 	}
 
-	// 2. CHECK: Build a "body" string excluding imports to check usage
-	var bodyBuilder strings.Builder
-	importLineIndices := make(map[int]bool)
-	for _, imp := range imports {
-		importLineIndices[imp.LineIndex] = true
+	// If nothing to remove, return original
+	if len(toRemove) == 0 {
+		return testCode
 	}
 
-	for i, line := range lines {
-		// We skip the lines we identified as imports so we don't match the import itself
-		if !importLineIndices[i] {
-			bodyBuilder.WriteString(line + "\n")
-		}
-	}
-	body := bodyBuilder.String()
+	// Sort removals by position (reverse order to avoid offset issues)
+	sort.Slice(toRemove, func(i, j int) bool {
+		return toRemove[i].start > toRemove[j].start
+	})
 
-	// 3. FILTER: Mark lines for removal
-	linesToRemove := make(map[int]bool)
-	for _, imp := range imports {
-		// Look for "PkgName." (e.g., "fmt.")
-		// \b ensures we don't match "fmt" inside "MyfmtFunction"
-		usageRe := regexp.MustCompile(fmt.Sprintf(`\b%s\.`, regexp.QuoteMeta(imp.PkgName)))
-
-		if !usageRe.MatchString(body) {
-			slog.Info("🧹 SANITIZER: Removing unused import", "package", imp.PkgName)
-			linesToRemove[imp.LineIndex] = true
+	// Remove the functions by rebuilding the source
+	result := []byte(testCode)
+	for _, rem := range toRemove {
+		// Ensure bounds are valid
+		if rem.start >= 0 && rem.end <= len(result) {
+			result = append(result[:rem.start], result[rem.end:]...)
 		}
 	}
 
-	// 4. REBUILD: Reconstruct the file
-	var result []string
-	for i, line := range lines {
-		if !linesToRemove[i] {
-			result = append(result, line)
-		}
-	}
-
-	return strings.Join(result, "\n")
+	return string(result)
 }
 
-func (a *Agent) optimizeSelf(ctx context.Context, step Step) error { return nil }
+// extractFunctionNames parses Go source and returns a set of all function names
+func extractFunctionNames(code string) map[string]bool {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "main.go", code, 0)
+	if err != nil {
+		return nil
+	}
+
+	funcs := make(map[string]bool)
+	for _, decl := range node.Decls {
+		if funcDecl, ok := decl.(*ast.FuncDecl); ok {
+			funcs[funcDecl.Name.Name] = true
+		}
+	}
+	return funcs
+}
+
+// sanitizeImports has been removed - goimports handles import management in the sandbox
+
+// optimizeSelf removed - implement in Phase 1 if needed
