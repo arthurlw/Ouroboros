@@ -18,13 +18,19 @@ type LLMAdapter struct {
 	provider llm.Provider
 }
 
-// NewClient creates a new LLM client using the new provider system
-func NewClient() *LLMAdapter {
+// NewClient creates a new LLM client using the provider auto-detection logic.
+// Returns an error if no provider can be constructed (e.g., all constructors fail).
+func NewClient() (*LLMAdapter, error) {
 	provider, err := llm.NewProvider()
 	if err != nil {
-		panic(fmt.Sprintf("failed to create LLM provider: %v", err))
+		return nil, fmt.Errorf("failed to create LLM provider: %w", err)
 	}
-	return &LLMAdapter{provider: provider}
+	return &LLMAdapter{provider: provider}, nil
+}
+
+// NewClientFromProvider wraps an explicit provider (useful for tests and --provider flag).
+func NewClientFromProvider(p llm.Provider) *LLMAdapter {
+	return &LLMAdapter{provider: p}
 }
 
 // Generate implements the legacy interface

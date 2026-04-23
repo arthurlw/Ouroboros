@@ -10,9 +10,13 @@ import (
 	"github.com/arthurlw/ouroboros/internal/agent"
 	"github.com/arthurlw/ouroboros/internal/sandbox"
 	"github.com/arthurlw/ouroboros/internal/skills"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// 0. Load .env file if present (silently ignore if missing)
+	_ = godotenv.Load()
+
 	// 1. CLI Parsing
 	goalPtr := flag.String("goal", "", "The objective for Ouroboros")
 	flag.Parse()
@@ -41,10 +45,14 @@ func main() {
 	}
 
 	// AI Modules
-	llm := agent.NewClient() // Auto-detects Groq/OpenAI/Ollama
-	planner := agent.NewPlanner(llm)
+	llmClient, err := agent.NewClient()
+	if err != nil {
+		slog.Error("Failed to initialize LLM provider", "error", err)
+		os.Exit(1)
+	}
+	planner := agent.NewPlanner(llmClient)
 	critic := agent.NewCritic()
-	generator := agent.NewGenerator(llm)
+	generator := agent.NewGenerator(llmClient)
 
 	// 4. Assemble Agent
 	ouroboros := &agent.Agent{
@@ -53,7 +61,7 @@ func main() {
 		Sandbox:   gym,
 		Registry:  registry,
 		Generator: generator,
-		LLM:       llm,
+		LLM:       llmClient,
 		Context:   context.Background(),
 	}
 

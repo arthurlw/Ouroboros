@@ -35,28 +35,30 @@ func NewProvider() (Provider, error) {
 
 // NewProviderByName creates a specific provider by name
 func NewProviderByName(name string) (Provider, error) {
+	var base Provider
 	switch name {
 	case "anthropic":
 		key := os.Getenv("ANTHROPIC_API_KEY")
 		if key == "" {
 			return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
 		}
-		return NewAnthropicProvider(key), nil
+		base = NewAnthropicProvider(key)
 	case "groq":
 		key := os.Getenv("GROQ_API_KEY")
 		if key == "" {
 			return nil, fmt.Errorf("GROQ_API_KEY not set")
 		}
-		return NewGroqProvider(key), nil
+		base = NewGroqProvider(key)
 	case "openai":
 		key := os.Getenv("OPENAI_API_KEY")
 		if key == "" {
 			return nil, fmt.Errorf("OPENAI_API_KEY not set")
 		}
-		return NewOpenAIProvider(key), nil
+		base = NewOpenAIProvider(key)
 	case "ollama":
-		return NewOllamaProvider(), nil
+		base = NewOllamaProvider()
 	default:
 		return nil, fmt.Errorf("unknown provider: %s", name)
 	}
+	return NewRetryProvider(base, DefaultRetryConfig()), nil
 }
