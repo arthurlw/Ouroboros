@@ -207,11 +207,17 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 
 	for i := 0; i < budget.MaxRetries; i++ {
 		slog.Info("🔄 ITERATION", "current", i+1, "max", budget.MaxRetries)
+		isLastIteration := i == budget.MaxRetries-1
 
 		result, err := a.Sandbox.ExecuteTest(ctx, code, test)
+
+		// Handle sandbox errors (including timeout)
 		if err != nil {
-			// Even on error, we may have a partial result with timeout info
 			if result != nil && result.FailureKind == sandbox.FailureTimeout {
+				if isLastIteration {
+					slog.Error("❌ CONVERGENCE FAILED: Timeout on final iteration.")
+					return fmt.Errorf("tool failed to converge after %d attempts (last failure: timeout)", budget.MaxRetries)
+				}
 				slog.Warn("🔴 TIMEOUT - Retrying with simpler implementation")
 				code, err = a.refineImplementation(code, test, "Code execution timed out. Simplify the implementation or reduce complexity.")
 				if err != nil {
@@ -228,9 +234,9 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 			return a.Registry.RegisterTool(step.ToolName, code, step.Description)
 		}
 
-		if i == budget.MaxRetries-1 {
-			slog.Error("❌ CONVERGENCE FAILED: Budget Exhausted.")
-			return fmt.Errorf("tool failed to converge after %d attempts", budget.MaxRetries)
+		if isLastIteration {
+			slog.Error("❌ CONVERGENCE FAILED: Budget Exhausted.", "last_kind", failureKind.String())
+			return fmt.Errorf("tool failed to converge after %d attempts (last failure: %s)", budget.MaxRetries, failureKind)
 		}
 
 		slog.Warn("🔴 TEST FAILED", "kind", failureKind.String(), "reason", feedback)
@@ -262,7 +268,7 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 
 		if err != nil { return err }
 	}
-	return nil
+	return fmt.Errorf("evolve loop exited unexpectedly") // defensive — should be unreachable
 }
 
 func (a *Agent) refineImplementation(code string, test string, feedback string) (string, error) {
