@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"ouroboros/internal/skills"
+	"regexp"
 	"strings"
-	"time"
+
+	"github.com/arthurlw/ouroboros/internal/skills"
 )
 
 type Plan struct {
@@ -81,10 +82,9 @@ INSTRUCTIONS:
 CONSTRAINT: Return ONLY raw JSON. No markdown.
 `, goal, strings.Join(toolList, "\n"))
 
-	rawResponse, err := p.LLM.Generate(ctx, systemPrompt)
+	rawResponse, err := p.LLM.Generate(ctx, systemPrompt, "You are Ouroboros. RETURN ONLY JSON.")
 	if err != nil { return Plan{}, err }
 
-	time.Sleep(500 * time.Millisecond)
 	logger.Info("🗣️ RAW LLM RESPONSE", "content", rawResponse)
 
 	rawResponse = cleanJSON(rawResponse)
@@ -96,6 +96,14 @@ CONSTRAINT: Return ONLY raw JSON. No markdown.
 
 	if len(plan.Steps) == 0 {
 		return Plan{}, fmt.Errorf("AI returned empty plan")
+	}
+
+	// Validate tool names
+	for i, step := range plan.Steps {
+		if err := validateToolName(step.ToolName); err != nil {
+			logger.Error("Invalid tool name in plan", "step", i+1, "tool", step.ToolName, "error", err)
+			return Plan{}, fmt.Errorf("step %d has invalid tool name %q: %w", i+1, step.ToolName, err)
+		}
 	}
 
 	logger.Info("🔵 PLAN GENERATED", "steps_count", len(plan.Steps))
@@ -111,4 +119,23 @@ func cleanJSON(s string) string {
 		}
 	}
 	return s
+}
+
+// validateToolName ensures tool names are safe and follow naming conventions
+// Must match: [a-z][a-z0-9_]{0,63}
+func validateToolName(name string) error {
+	if name == "" {
+		return fmt.Errorf("tool name cannot be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("tool name too long (max 64 characters)")
+	}
+
+	// Must start with lowercase letter, followed by lowercase letters, digits, or underscores
+	validName := regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	if !validName.MatchString(name) {
+		return fmt.Errorf("tool name must start with [a-z] and contain only [a-z0-9_]")
+	}
+
+	return nil
 }

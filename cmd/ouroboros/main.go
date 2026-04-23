@@ -5,10 +5,11 @@ import (
 	"flag"
 	"log/slog"
 	"os"
-	"ouroboros/internal/agent"
-	"ouroboros/internal/sandbox"
-	"ouroboros/internal/skills"
 	"path/filepath"
+
+	"github.com/arthurlw/ouroboros/internal/agent"
+	"github.com/arthurlw/ouroboros/internal/sandbox"
+	"github.com/arthurlw/ouroboros/internal/skills"
 )
 
 func main() {

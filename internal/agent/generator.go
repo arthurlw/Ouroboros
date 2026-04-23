@@ -60,7 +60,7 @@ Block 2: Updated test (markdown 'go')
 `, requirement, existingCode, existingTest)
 	}
 
-	raw, err := g.LLM.Generate(ctx, prompt)
+	raw, err := g.LLM.Generate(ctx, prompt, "You are a Senior Go Developer. Return code in markdown blocks.")
 	if err != nil { return "", "", err }
 
 	code := extractBlock(raw, "go")

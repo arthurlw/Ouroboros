@@ -1,4 +1,4 @@
-module ouroboros
+module github.com/arthurlw/ouroboros
 
 go 1.25.4
 

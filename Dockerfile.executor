@@ -4,6 +4,9 @@ FROM golang:1.25.4-alpine
 # Install build tools
 RUN apk add --no-cache git make build-base
 
+# Install goimports for automatic import management
+RUN go install golang.org/x/tools/cmd/goimports@latest
+
 WORKDIR /workspace
 
 # By default, run tests in verbose mode
