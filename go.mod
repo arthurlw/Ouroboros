@@ -2,7 +2,10 @@ module github.com/arthurlw/ouroboros
 
 go 1.25.4
 
-require github.com/docker/docker v24.0.7+incompatible
+require (
+	github.com/docker/docker v24.0.7+incompatible
+	github.com/joho/godotenv v1.5.1
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.1 // indirect
