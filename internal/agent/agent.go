@@ -197,21 +197,27 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 
 		slog.Warn("🔴 TEST FAILED", "reason", feedback)
 
+		// Routing is unchanged: a build failure is sent to whichever file the
+		// compiler blamed, otherwise the ping-pong alternates. Note that routing a
+		// main_test.go build failure to the test author does not widen what it can
+		// see - it still receives signatures only. Compiler errors quoting lines of
+		// main.go are passed through verbatim, because an error message is feedback,
+		// not source access.
 		if strings.Contains(feedback, "[build failed]") {
 			if strings.Contains(feedback, "main.go") {
-				code, err = a.refineImplementation(code, test, feedback)
+				code, err = a.refineImplementation(code, step.Prompt, feedback)
 			} else if strings.Contains(feedback, "main_test.go") {
-				test, err = a.refineTestSuite(code, test, feedback)
+				test, err = a.refineTestSuite(code, test, step.Prompt, feedback)
 			} else {
-				code, err = a.refineImplementation(code, test, feedback)
+				code, err = a.refineImplementation(code, step.Prompt, feedback)
 			}
 		} else {
 			if i%2 == 0 {
-				slog.Info("🔧 REFINING IMPLEMENTATION (Aligning Code to Test)")
-				code, err = a.refineImplementation(code, test, feedback)
+				slog.Info("🔧 REFINING IMPLEMENTATION (Code sees the spec and the failures, not the test file)")
+				code, err = a.refineImplementation(code, step.Prompt, feedback)
 			} else {
-				slog.Info("🔧 REFINING TEST SUITE (Aligning Test to Code)")
-				test, err = a.refineTestSuite(code, test, feedback)
+				slog.Info("🔧 REFINING TEST SUITE (Test sees the spec and main.go signatures, not the bodies)")
+				test, err = a.refineTestSuite(code, test, step.Prompt, feedback)
 			}
 		}
 
@@ -220,53 +226,80 @@ func (a *Agent) evolveTool(ctx context.Context, step Step, budget ConvergenceBud
 	return nil
 }
 
-func (a *Agent) refineImplementation(code string, test string, feedback string) (string, error) {
+// refineImplementation repairs main.go.
+//
+// It is deliberately not given the source of main_test.go. The implementer sees
+// its own file, the original specification, and the Critic's failure feedback -
+// test names, expected vs actual values, panic messages and compiler line
+// numbers. That is enough to fix logic, and not enough to reverse-engineer the
+// test file and special-case it.
+func (a *Agent) refineImplementation(code string, spec string, feedback string) (string, error) {
 	prompt := fmt.Sprintf(`
 You are a Senior Go Developer.
 TASK: Fix the implementation file (main.go).
 
+ORIGINAL SPECIFICATION:
+%s
+
 CONTEXT - IMPLEMENTATION (main.go):
 %s
 
-CONTEXT - TEST SUITE (main_test.go) [READ ONLY]:
-%s
-
-ERROR LOG:
+FAILURE FEEDBACK (failing test names, expected vs actual, panics, line numbers):
 %s
 
 INSTRUCTIONS:
-1. Fix the logic error in main.go.
-2. Ensure 'package main'.
-3. DO NOT include test functions (TestXXX).
-4. RETURN ONLY the raw Go code for main.go inside a markdown block.
-`, code, test, feedback)
+1. You cannot see main_test.go. Fix main.go so that it satisfies the SPECIFICATION;
+   the feedback tells you where the current behaviour deviates from it.
+2. Fix the general logic. Do NOT special-case the specific values quoted in the feedback.
+3. Ensure 'package main'.
+4. DO NOT include test functions (TestXXX).
+5. RETURN ONLY the raw Go code for main.go inside a markdown block.
+`, spec, code, feedback)
 
 	newCode, err := a.LLM.Generate(a.Context, prompt)
 	if err != nil { return "", err }
 	return extractBlock(newCode, "go"), nil
 }
 
-func (a *Agent) refineTestSuite(code string, test string, feedback string) (string, error) {
+// refineTestSuite repairs main_test.go.
+//
+// It is deliberately not given the bodies of main.go, only the signature view
+// produced by ExtractSignatures: package clause, imports, type and struct
+// declarations, constants, and function signatures. The test author needs the
+// interface to write a suite that compiles, but seeing the logic makes it write
+// tests that mirror the implementation's mistakes.
+//
+// The full code is still a parameter because sanitizeTestSuite runs against it
+// in Go, on this side of the network call. It never enters the prompt.
+func (a *Agent) refineTestSuite(code string, test string, spec string, feedback string) (string, error) {
+	signatures := ExtractSignatures(code)
+
 	prompt := fmt.Sprintf(`
 You are a Senior Go Developer.
 TASK: Fix the test suite (main_test.go).
 
-CONTEXT - IMPLEMENTATION (main.go) [READ ONLY - DO NOT COPY]:
+ORIGINAL SPECIFICATION:
+%s
+
+CONTEXT - IMPLEMENTATION INTERFACE (main.go, signatures only - all bodies removed):
 %s
 
 CONTEXT - TEST SUITE (main_test.go):
 %s
 
-ERROR LOG:
+FAILURE FEEDBACK (failing test names, expected vs actual, panics, line numbers):
 %s
 
 INSTRUCTIONS:
-1. Fix the test logic.
-2. Ensure 'package main'.
-3. CRITICAL: DO NOT copy functions or structs from main.go.
-4. CRITICAL: DO NOT include 'func main()'.
-5. RETURN ONLY the raw Go code for main_test.go inside a markdown block.
-`, code, test, feedback)
+1. You cannot see the bodies of main.go. Use the interface above only to call the
+   right identifiers with the right types.
+2. Derive every expected value from the SPECIFICATION. Never assume the
+   implementation is correct and write the test to agree with it.
+3. Ensure 'package main'.
+4. CRITICAL: DO NOT redeclare anything shown in the interface. It already exists in main.go.
+5. CRITICAL: DO NOT include 'func main()'.
+6. RETURN ONLY the raw Go code for main_test.go inside a markdown block.
+`, spec, signatures, test, feedback)
 
 	newTest, err := a.LLM.Generate(a.Context, prompt)
 	if err != nil { return "", err }
