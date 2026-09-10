@@ -35,6 +35,19 @@ The system solves the issue of LLM hallucinations by trapping the model in a fee
 1.  **Ping-Pong Strategy:** Alternates focus between fixing `main.go` (Implementation) and `main_test.go` (Test Suite) to prevent logical deadlocks.
 2.  **Smart Sanitization:** Uses Regex-based filtering to strip duplicate functions and prevent "Redeclaration Errors" common in LLM outputs.
 
+### Asymmetric Visibility
+
+The two refinement roles do not see the same thing. An agent that can read both files will make them agree with each other rather than with the specification: it edits the test until the current implementation passes. The result is a tool that is green and wrong.
+
+The separation is enforced by what is put into the prompt, not by instructing the model to ignore what it can see.
+
+* **The Implementer (`refineImplementation`)** receives `main.go`, the original step specification, and the Critic's failure feedback — failing test names, expected versus actual values, panic messages and line numbers. It does not receive the source of `main_test.go`.
+* **The Test Author (`refineTestSuite`)** receives `main_test.go`, the original step specification, the same failure feedback, and a signature-only view of `main.go`. It does not receive any function body.
+
+The signature view is produced by `ExtractSignatures` (`internal/agent/signatures.go`), which parses the file with `go/parser` and prints it back with every function body removed, keeping the package clause, imports, type and struct declarations, constants and function signatures. Unlike the regex sanitizers, this is a real parse rather than a best-effort match. If the generated source does not parse — which happens while it is mid-repair — the view degrades to a `// [implementation unparseable this iteration]` placeholder; it never falls back to the full source, since that would hand over exactly what the split exists to withhold.
+
+The test author needs the interface in order to write a suite that compiles, so full blindness is not available. Signature-only is the compromise. Compiler errors that quote lines of `main.go` are still passed through verbatim in both directions: an error message is feedback, not source access.
+
 ---
 
 ## Phase 1

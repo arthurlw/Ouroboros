@@ -69,7 +69,7 @@ func Worker(data string) {
 	// Check 4: (Optional) Verify specific structure
 	// We expect a line like: "↳ Calls: [Worker, fmt.Println, os.Getenv]"
 	// Since order can vary, we just ensure the block exists under Orchestrator.
-	orchestratorBlock := extractBlock(summary, "func Orchestrator()")
+	orchestratorBlock := extractFuncBlock(summary, "func Orchestrator()")
 	if !strings.Contains(orchestratorBlock, "↳ Calls:") {
 		t.Errorf("Orchestrator function missing 'Calls' block")
 	}
@@ -156,7 +156,7 @@ func Repository() {
 
 // Helper to find the text block for a specific function to ensure we aren't matching
 // calls from the wrong function.
-func extractBlock(fullText, funcHeader string) string {
+func extractFuncBlock(fullText, funcHeader string) string {
 	parts := strings.Split(fullText, funcHeader)
 	if len(parts) < 2 {
 		return ""
